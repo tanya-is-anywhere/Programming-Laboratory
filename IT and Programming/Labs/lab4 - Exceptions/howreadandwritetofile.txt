@@ -1,0 +1,36 @@
+import java.io.BufferedReader;
+import java.io.BufferedWriter;
+import java.io.FileWriter;
+import java.io.FileReader;
+import java.io.IOException;
+
+public class CustomEmailFormatException {
+
+    public static void main(String[] args) {
+        // how to write to a file
+        String[] array = {"Lilya", "Melony", "John"};
+        try {
+            BufferedWriter writer = new BufferedWriter(new FileWriter("D:/otherfiles/ITandP/Labs/lab4/test1.txt"));
+            writer.write("Some string");
+            for (String iterable_element : array) { // этот цикл нужен для записи элементов массива
+                writer.write("\n"+iterable_element);
+            }
+            writer.close();
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+        // how to read from a file
+        try {
+            BufferedReader reader = new BufferedReader(new FileReader("D:/otherfiles/ITandP/Labs/lab4/test1.txt"));
+           // System.out.println(reader.readLine()); // этот метод считывает лишь одну строку
+            String line;
+            while ((line = reader.readLine()) != null) {
+                System.out.println(line);
+            }
+            reader.close();
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+
+    }
+}

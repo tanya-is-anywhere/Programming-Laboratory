@@ -1,0 +1,4 @@
+ошибка при чтении catch (IOException e) {
+            System.err.println("Ошибка при чтении файла: " + e.getMessage());
+        }
+выбрасывается тогда когда мы убираем FileNotFoundException
