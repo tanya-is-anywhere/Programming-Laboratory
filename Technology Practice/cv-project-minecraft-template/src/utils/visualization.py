@@ -103,7 +103,7 @@ def plot_training_history(
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.close()
 
-    print(f"✅ Графики сохранены: {save_path}")
+    print(f"Графики сохранены: {save_path}")
     return str(save_path)
 
 def plot_confusion_matrix(
@@ -140,7 +140,7 @@ def plot_confusion_matrix(
             cm_data = np.load(cm_path)
 
     if cm_data is None:
-        print("⚠️ Нет данных для матрицы ошибок")
+        print("Нет данных для матрицы ошибок")
         return None
 
     # Нормализация
@@ -176,7 +176,7 @@ def plot_confusion_matrix(
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.close()
 
-    print(f"✅ Матрица ошибок сохранена: {save_path}")
+    print(f"Матрица ошибок сохранена: {save_path}")
     return str(save_path)
 
 def visualize_detections(
@@ -195,7 +195,7 @@ def visualize_detections(
 
     image = cv2.imread(str(image_path))
     if image is None:
-        print(f"❌ Не удалось загрузить изображение: {image_path}")
+        print(f"Не удалось загрузить изображение: {image_path}")
         return None
 
     image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
@@ -248,7 +248,7 @@ def visualize_detections(
             labels = results['labels'].detach().cpu().numpy()
 
     except Exception as e:
-        print(f"⚠️ Ошибка при инференсе: {e}")
+        print(f"Ошибка при инференсе: {e}")
         return None
 
     # Фильтруем по порогу
@@ -273,5 +273,5 @@ def visualize_detections(
     save_path = save_dir / f'detection_{model_name}_{Path(image_path).stem}.png'
     cv2.imwrite(str(save_path), image_cv)
 
-    print(f"✅ Детекция сохранена: {save_path}")
+    print(f"Детекция сохранена: {save_path}")
     return str(save_path)
