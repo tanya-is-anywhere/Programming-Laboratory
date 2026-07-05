@@ -366,12 +366,12 @@ def process_video(
             output_file = Path(output_path)
             if output_file.exists():
                 size_mb = output_file.stat().st_size / (1024 * 1024)
-                logger.info(f"✅ Video saved: {output_path} ({size_mb:.2f} MB)")
-                print(f"✅ Video saved: {output_path} ({size_mb:.2f} MB)")
+                logger.info(f"Video saved: {output_path} ({size_mb:.2f} MB)")
+                print(f"Video saved: {output_path} ({size_mb:.2f} MB)")
             else:
-                logger.error(f"❌ Video NOT saved: {output_path}")
+                logger.error(f"Video NOT saved: {output_path}")
         elif not save_output:
-            logger.info("ℹ️ Video saving was disabled (save_output=False)")
+            logger.info("Video saving was disabled (save_output=False)")
 
         return stats
 
