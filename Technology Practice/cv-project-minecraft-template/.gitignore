@@ -1,0 +1,34 @@
+# Результаты экспериментов
+results/
+outputs/
+
+# Логи
+*.log
+
+# Чекпоинты моделей
+*.pt
+*.pth
+*.onnx
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.eggs/
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/
+
+# Данные
+data/processed/
+data/raw/  # или закомментируй, если хочешь хранить данные в репо
+
+# Виртуальное окружение
+venv/
+env/

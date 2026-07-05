@@ -1,0 +1,126 @@
+# ============================================
+# Minecraft Mobs Detection Configuration
+# ============================================
+
+project:
+  name: "minecraft_mobs_detection"
+  version: "1.0.0"
+  description: "5-model comparison for Minecraft mob detection"
+
+data:
+  raw_path: "D:\otherfiles\Учебная практика Технологическая\minecraft-mobs-yolo-dataset\minecraft_mobs_yolo" #"data/raw/minecraft_mobs"
+  processed_path: "data/processed"
+  batch_size: 16
+  image_size: 640
+  num_classes: 6
+  class_names: ["zombie", "skeleton", "creeper", "spider", "enderman", "pig"]
+  
+  splits:
+    train: 0.7
+    val: 0.15
+    test: 0.15
+  
+  augmentation:
+    train:
+      hsv_h: 0.015
+      hsv_s: 0.7
+      hsv_v: 0.4
+      degrees: 10.0
+      translate: 0.1
+      scale: 0.5
+      shear: 2.0
+      fliplr: 0.5
+      mosaic: 0.8
+      mixup: 0.1
+    val:
+      hsv_h: 0.0
+      hsv_s: 0.0
+      hsv_v: 0.0
+
+models:
+  yolo:
+    variant: "yolov8n"
+    pretrained: true
+    epochs: 100
+    optimizer: "adamw"
+    lr: 0.001
+    momentum: 0.937
+    weight_decay: 0.0005
+    warmup_epochs: 3
+    box: 7.5
+    cls: 0.5
+    dfl: 1.5
+    
+  faster_rcnn:
+    backbone: "resnet50"
+    pretrained: true
+    epochs: 100
+    optimizer: "sgd"
+    lr: 0.005
+    momentum: 0.9
+    weight_decay: 0.0005
+    lr_scheduler: "step"
+    lr_step_size: 30
+    lr_gamma: 0.1
+    
+  detr:
+    backbone: "resnet50"
+    pretrained: true
+    epochs: 150
+    optimizer: "adamw"
+    lr: 0.0001
+    lr_backbone: 0.00001
+    weight_decay: 0.0001
+    lr_scheduler: "cosine"
+    num_queries: 100
+    hidden_dim: 256
+    
+  rt_detr:
+    backbone: "resnet50"
+    pretrained: true
+    epochs: 100
+    optimizer: "adamw"
+    lr: 0.0001
+    weight_decay: 0.0001
+    
+  yolo_world:
+    variant: "yolo_world_s"
+    pretrained: true
+    epochs: 80
+    optimizer: "adamw"
+    lr: 0.001
+    weight_decay: 0.0005
+    prompt: "zombie. skeleton. creeper. spider. enderman. pig."
+
+training:
+  device: "cuda"  # "cpu" если нет GPU
+  seed: 42
+  num_workers: 4
+  
+  early_stopping:
+    patience: 10
+    min_delta: 0.001
+    metric: "mAP_0.5"
+    
+  mixed_precision: true  # fp16 для скорости
+  
+  logging:
+    log_interval: 10
+    save_interval: 5
+    tensorboard: true
+    wandb: false
+
+evaluation:
+  iou_threshold: 0.5
+  conf_threshold: 0.25
+  metrics: ["mAP_0.5", "mAP_0.5:0.95", "precision", "recall", "f1"]
+  speed_test: true  # измерить inference time
+
+results:
+  root_dir: "results"
+  plots_dir: "results/plots"
+  logs_dir: "results/logs"
+  models_dir: "results/models"
+  predictions_dir: "results/predictions"
+  
+  save_predictions: 50  # сохранить N примеров детекций
