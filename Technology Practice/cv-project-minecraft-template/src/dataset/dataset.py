@@ -6,10 +6,12 @@
 import os
 import json
 import random
+from collections import defaultdict
+from decimal import Decimal
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Union, Callable
 import logging
-
+from torchvision import transforms as T
 import cv2
 import numpy as np
 import torch
@@ -37,12 +39,9 @@ class MinecraftMobsDataset(Dataset):
             transform: Optional[Callable] = None,
             target_transform: Optional[Callable] = None,
             img_size: int = 640,
-            num_classes: int = 6,
+            num_classes: int = 5,
             class_names: List[str] = None,
-            use_mosaic: bool = False,
-            mosaic_prob: float = 0.5,
-            use_mixup: bool = False,
-            mixup_prob: float = 0.1,
+            box_format: str = 'xyxy',
             debug: bool = False
     ):
         """
@@ -54,10 +53,6 @@ class MinecraftMobsDataset(Dataset):
             img_size: Размер изображения после ресайза
             num_classes: Количество классов
             class_names: Имена классов
-            use_mosaic: Использовать Mosaic augmentation
-            mosaic_prob: Вероятность применения mosaic
-            use_mixup: Использовать MixUp augmentation
-            mixup_prob: Вероятность применения mixup
             debug: Режим отладки (меньше логов, больше проверок)
         """
         self.data_dir = Path(data_dir)
@@ -65,10 +60,7 @@ class MinecraftMobsDataset(Dataset):
         self.img_size = img_size
         self.num_classes = num_classes
         self.class_names = class_names or [f"class_{i}" for i in range(num_classes)]
-        self.use_mosaic = use_mosaic and split == 'train'
-        self.mosaic_prob = mosaic_prob
-        self.use_mixup = use_mixup and split == 'train'
-        self.mixup_prob = mixup_prob
+        self.box_format = box_format
         self.debug = debug
 
         # Пути к данным
@@ -125,207 +117,203 @@ class MinecraftMobsDataset(Dataset):
         name = Path(img_file).stem
         return self.labels_dir / f"{name}.txt"
 
-    def _get_default_transforms(self) -> Callable:
-        """Создание дефолтных трансформаций в зависимости от сплита"""
+    def _get_torchvision_transforms(self) -> T.Compose:
+        """Трансформации через Torchvision (без Albumentations)"""
         if self.split == 'train':
-            return A.Compose([
-                # Ресайз
-                A.Resize(self.img_size, self.img_size),
-
-                # Аугментации для разнообразия
-                A.HueSaturationValue(
-                    hue_shift_limit=15,
-                    sat_shift_limit=30,
-                    val_shift_limit=20,
-                    p=0.5
-                ),
-                A.RandomBrightnessContrast(
-                    brightness_limit=0.2,
-                    contrast_limit=0.2,
-                    p=0.5
-                ),
-                A.GaussNoise(var_limit=(10.0, 50.0), p=0.2),
-
-                # Геометрические аугментации
-                A.HorizontalFlip(p=0.5),
-                A.VerticalFlip(p=0.1),
-                A.Rotate(limit=10, border_mode=cv2.BORDER_CONSTANT, p=0.3),
-                A.ShiftScaleRotate(
-                    shift_limit=0.1,
-                    scale_limit=0.1,
-                    rotate_limit=0,
-                    border_mode=cv2.BORDER_CONSTANT,
-                    p=0.3
-                ),
-
-                # Blur для устойчивости
-                A.OneOf([
-                    A.GaussianBlur(blur_limit=(3, 7), p=1.0),
-                    A.MedianBlur(blur_limit=5, p=1.0),
-                    A.MotionBlur(blur_limit=5, p=1.0),
-                ], p=0.2),
-
-                # Нормализация
-                A.Normalize(
-                    mean=[0.485, 0.456, 0.406],
-                    std=[0.229, 0.224, 0.225]
-                ),
-                ToTensorV2(),
-            ], bbox_params=A.BboxParams(
-                format='yolo',
-                min_visibility=0.3,
-                label_fields=['class_labels']
-            ))
+            return T.Compose([
+                T.ToPILImage(),
+                T.Resize((self.img_size, self.img_size)),
+                T.RandomHorizontalFlip(p=0.5),
+                T.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
+                T.ToTensor(),
+                T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            ])
         else:
-            # Валидация/тест - только базовые трансформации
-            return A.Compose([
-                A.Resize(self.img_size, self.img_size),
-                A.Normalize(
-                    mean=[0.485, 0.456, 0.406],
-                    std=[0.229, 0.224, 0.225]
-                ),
-                ToTensorV2(),
-            ], bbox_params=A.BboxParams(
-                format='yolo',
-                min_visibility=0.3,
-                label_fields=['class_labels']
-            ))
+            return T.Compose([
+                T.ToPILImage(),
+                T.Resize((self.img_size, self.img_size)),
+                T.ToTensor(),
+                T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            ])
 
     def __len__(self) -> int:
         return len(self.image_files)
 
     def __getitem__(self, idx: int) -> Dict:
-        """
-        Возвращает элемент датасета
-
-        Returns:
-            Dict с ключами:
-                - 'image': torch.Tensor (C, H, W)
-                - 'boxes': torch.Tensor (N, 4) в формате [x1, y1, x2, y2] (пиксели)
-                - 'labels': torch.Tensor (N,)
-                - 'image_id': int
-                - 'orig_size': Tuple (H, W)
-                - 'image_path': str
-        """
-        # Mosaic augmentation (только для тренировки)
-        if self.use_mosaic and random.random() < self.mosaic_prob:
-            return self._get_mosaic_item(idx)
-
-        # Загрузка изображения и аннотаций
         img_file = self.image_files[idx]
         img_path = self.images_dir / img_file
         label_path = self._get_label_path(img_file)
 
         # Загрузка изображения
-        image = cv2.imread(str(img_path))
-        if image is None:
+        image_raw = cv2.imread(str(img_path))
+        if image_raw is None:
             raise RuntimeError(f"Failed to load image: {img_path}")
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        orig_size = image.shape[:2]
+        image_raw = cv2.cvtColor(image_raw, cv2.COLOR_BGR2RGB)
+        orig_h, orig_w = image_raw.shape[:2]
 
-        # Загрузка аннотаций
-        boxes_yolo, labels = self._load_yolo_annotations(label_path)
-
-        # Применяем аугментации
-        if self.transform and len(boxes_yolo) > 0:
-            transformed = self.transform(
-                image=image,
-                bboxes=boxes_yolo,
-                class_labels=labels
-            )
-            image = transformed['image']
-            boxes_yolo = transformed['bboxes']
-            labels = transformed['class_labels']
-        elif self.transform:
-            # Если нет боксов, применяем трансформации только к изображению
-            transformed = self.transform(
-                image=image,
-                bboxes=[],
-                class_labels=[]
-            )
-            image = transformed['image']
-            boxes_yolo = []
-            labels = []
-
-        # Конвертируем YOLO формат в [x1, y1, x2, y2]
-        boxes_pixel = self._yolo_to_pixel(boxes_yolo, self.img_size, self.img_size)
-
-        # MixUp augmentation
-        if self.use_mixup and random.random() < self.mixup_prob and len(boxes_pixel) > 0:
-            mix_idx = random.randint(0, len(self) - 1)
-            mix_item = self[mix_idx]
-
-            # Смешиваем изображения и аннотации
-            lambda_val = np.random.beta(0.5, 0.5)
-            image = lambda_val * image + (1 - lambda_val) * mix_item['image']
-
-            # Объединяем аннотации
-            boxes_pixel = torch.cat([boxes_pixel, mix_item['boxes']], dim=0)
-            labels = torch.cat([
-                torch.tensor(labels),
-                mix_item['labels']
-            ], dim=0)
-
-        # Создаем тензоры
-        boxes_tensor = torch.tensor(boxes_pixel, dtype=torch.float32) if len(boxes_pixel) > 0 else torch.zeros((0, 4),
-                                                                                                               dtype=torch.float32)
-        labels_tensor = torch.tensor(labels, dtype=torch.long) if len(labels) > 0 else torch.zeros(0, dtype=torch.long)
-
-        sample = {
-            'image': image,
-            'boxes': boxes_tensor,
-            'labels': labels_tensor,
-            'image_id': idx,
-            'orig_size': orig_size,
-            'image_path': str(img_path)
-        }
-
-        # Дополнительные трансформации целевых переменных
-        if self.target_transform:
-            sample = self.target_transform(sample)
-
-        return sample
-
-    def _load_yolo_annotations(self, label_path: Path) -> Tuple[List, List]:
-        """
-        Загрузка аннотаций в формате YOLO
-
-        YOLO формат: class_id center_x center_y width height (нормализованные)
-
-        Args:
-            label_path: Путь к файлу аннотации
-
-        Returns:
-            Кортеж (boxes, labels)
-        """
-        boxes = []
-        labels = []
+        # Загрузка аннотаций в пикселях на оригинальном изображении
+        boxes_xyxy_pixels = []
+        labels_list = []
 
         if label_path.exists():
-            try:
-                with open(label_path, 'r') as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line:
-                            continue
+            with open(label_path, 'r') as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if len(parts) < 5:
+                        continue
+                    cls_id = int(parts[0])
+                    cx, cy, w, h = map(float, parts[1:5])
 
-                        parts = line.split()
-                        if len(parts) >= 5:
-                            class_id = int(parts[0])
-                            bbox = [float(x) for x in parts[1:5]]
+                    # Защита от некорректных значений
+                    w = max(1e-6, min(1.0, w))
+                    h = max(1e-6, min(1.0, h))
+                    cx = max(0.0, min(1.0, cx))
+                    cy = max(0.0, min(1.0, cy))
 
-                            # Проверка корректности
-                            if all(0 <= x <= 1 for x in bbox) and 0 <= class_id < self.num_classes:
-                                boxes.append(bbox)
-                                labels.append(class_id)
-                            elif self.debug:
-                                logger.warning(f"Invalid annotation in {label_path}: {line}")
+                    # Считаем координаты в пикселях на оригинальном изображении
+                    x1_px = (cx - w / 2.0) * orig_w
+                    y1_px = (cy - h / 2.0) * orig_h
+                    x2_px = (cx + w / 2.0) * orig_w
+                    y2_px = (cy + h / 2.0) * orig_h
 
-            except Exception as e:
-                logger.error(f"Error loading {label_path}: {e}")
+                    # Обрезаем по границам
+                    x1_px = max(0, x1_px)
+                    y1_px = max(0, y1_px)
+                    x2_px = min(orig_w, x2_px)
+                    y2_px = min(orig_h, y2_px)
 
+                    if x2_px <= x1_px or y2_px <= y1_px:
+                        continue
+
+                    boxes_xyxy_pixels.append([x1_px, y1_px, x2_px, y2_px])
+                    labels_list.append(cls_id)
+
+        # Применяем трансформации через Torchvision
+        transform = self._get_torchvision_transforms()
+        image = transform(image_raw)
+
+        # Масштабируем боксы под новый размер
+        new_size = self.img_size
+        scale_w = new_size / orig_w
+        scale_h = new_size / orig_h
+
+        boxes_resized = []
+        for x1, y1, x2, y2 in boxes_xyxy_pixels:
+            boxes_resized.append([
+                x1 * scale_w,
+                y1 * scale_h,
+                x2 * scale_w,
+                y2 * scale_h
+            ])
+
+        if len(boxes_resized) == 0:
+            boxes_tensor = torch.empty((0, 4), dtype=torch.float32)
+            labels_tensor = torch.empty((0,), dtype=torch.long)
+        else:
+            boxes_tensor = torch.tensor(boxes_resized, dtype=torch.float32)
+            labels_tensor = torch.tensor(labels_list, dtype=torch.long)
+
+        # Возвращаем в едином формате для всех моделей
+        return {
+            'pixel_values': image,
+            'labels': {
+                'boxes': boxes_tensor,
+                'labels': labels_tensor
+            },
+            'orig_size': (orig_h, orig_w),
+            'image_path': str(img_path),
+            'image_id': idx
+        }
+
+    def _load_yolo_annotations(self, label_path: Path):
+        boxes, labels = [], []
+        if label_path.exists():
+            for line in open(label_path).readlines():
+                parts = line.strip().split()
+                if len(parts) >= 5:
+                    coords = [max(0.0, min(1.0, float(x))) for x in parts[1:5]]
+                    boxes.append(coords)
+                    labels.append(int(parts[0]))
         return boxes, labels
 
+    def _convert_boxes(
+            self,
+            boxes_yolo: List[List[float]],
+            orig_w: int,
+            orig_h: int,
+            target_w: int,
+            target_h: int
+    ) -> np.ndarray:
+        """
+        Конвертирует боксы из YOLO формата в нужный формат.
+
+        Args:
+            boxes_yolo: List of [cx, cy, w, h] нормализованные (0..1)
+            orig_w, orig_h: Оригинальный размер изображения
+            target_w, target_h: Размер после ресайза
+
+        Returns:
+            np.ndarray (N, 4) в формате, заданном self.box_format
+        """
+        if not boxes_yolo:
+            return np.array([], dtype=np.float32).reshape(0, 4)
+
+        converted = []
+        for box in boxes_yolo:
+            cx, cy, w, h = box
+
+            if self.box_format == 'cxcywh':
+                # Для DETR: нормализованные cx, cy, w, h (относительно target)
+                converted.append([cx, cy, w, h])
+
+            elif self.box_format == 'yolo':
+                # Для YOLO: просто возвращаем как есть
+                converted.append([cx, cy, w, h])
+
+            elif self.box_format == 'pixel_xyxy_orig':
+                # Для Faster R-CNN: пиксели на оригинальном изображении
+                x1 = (cx - w / 2) * orig_w
+                y1 = (cy - h / 2) * orig_h
+                x2 = (cx + w / 2) * orig_w
+                y2 = (cy + h / 2) * orig_h
+                # Клиппинг по границам
+                x1 = max(0, min(orig_w, x1))
+                y1 = max(0, min(orig_h, y1))
+                x2 = max(0, min(orig_w, x2))
+                y2 = max(0, min(orig_h, y2))
+                converted.append([x1, y1, x2, y2])
+
+            elif self.box_format == 'xyxy':
+                # Для RT-DETR: пиксели на изображении после ресайза
+                x1 = (cx - w / 2) * target_w
+                y1 = (cy - h / 2) * target_h
+                x2 = (cx + w / 2) * target_w
+                y2 = (cy + h / 2) * target_h
+                x1 = max(0, min(target_w, x1))
+                y1 = max(0, min(target_h, y1))
+                x2 = max(0, min(target_w, x2))
+                y2 = max(0, min(target_h, y2))
+                converted.append([x1, y1, x2, y2])
+            else:
+                raise ValueError(f"Unknown box_format: {self.box_format}")
+
+        return np.array(converted, dtype=np.float32)
+
+    def _get_default_transforms(self) -> Callable:
+        if self.split == 'train':
+            return A.Compose([
+                A.Resize(self.img_size, self.img_size),
+                A.HorizontalFlip(p=0.5),
+                A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1, p=0.5),
+                A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+                ToTensorV2(),
+            ], bbox_params=A.BboxParams(format='yolo', min_visibility=0.0, label_fields=['class_labels']))
+        else:
+            return A.Compose([
+                A.Resize(self.img_size, self.img_size),
+                A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+                ToTensorV2(),
+            ], bbox_params=A.BboxParams(format='yolo', min_visibility=0.0, label_fields=['class_labels']))
     def _yolo_to_pixel(
             self,
             boxes: List[List[float]],
@@ -348,93 +336,6 @@ class MinecraftMobsDataset(Dataset):
             pixel_boxes.append([x1, y1, x2, y2])
 
         return np.array(pixel_boxes, dtype=np.float32) if pixel_boxes else np.array([])
-
-    def _get_mosaic_item(self, idx: int) -> Dict:
-        """
-        Mosaic augmentation - объединение 4 изображений в одно
-
-        Returns:
-            Dict с объединенным изображением и аннотациями
-        """
-        # Выбираем 4 случайных изображения
-        indices = [idx] + [random.randint(0, len(self) - 1) for _ in range(3)]
-
-        # Центральная точка соединения
-        cx = int(random.uniform(self.img_size // 4, 3 * self.img_size // 4))
-        cy = int(random.uniform(self.img_size // 4, 3 * self.img_size // 4))
-
-        mosaic_image = np.full((self.img_size * 2, self.img_size * 2, 3), 114, dtype=np.uint8)
-        mosaic_boxes = []
-        mosaic_labels = []
-
-        # Позиции для 4 изображений
-        positions = [
-            (0, 0, cx, cy),  # top-left
-            (cx, 0, self.img_size, cy),  # top-right
-            (0, cy, cx, self.img_size),  # bottom-left
-            (cx, cy, self.img_size, self.img_size)  # bottom-right
-        ]
-
-        for i, (mosaic_idx, (x1, y1, x2, y2)) in enumerate(zip(indices, positions)):
-            # Загружаем изображение
-            img_file = self.image_files[mosaic_idx]
-            img_path = self.images_dir / img_file
-            label_path = self._get_label_path(img_file)
-
-            img = cv2.imread(str(img_path))
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            img = cv2.resize(img, (x2 - x1, y2 - y1))
-
-            # Размещаем в мозаике
-            mosaic_image[y1:y2, x1:x2] = img
-
-            # Загружаем аннотации и масштабируем
-            boxes_yolo, labels = self._load_yolo_annotations(label_path)
-
-            for box, label in zip(boxes_yolo, labels):
-                # Конвертируем YOLO в пиксели для оригинального изображения
-                orig_w = x2 - x1
-                orig_h = y2 - y1
-
-                cx_box = box[0] * orig_w + x1
-                cy_box = box[1] * orig_h + y1
-                w = box[2] * orig_w
-                h = box[3] * orig_h
-
-                # Конвертируем обратно в YOLO для всего мозаичного изображения
-                mosaic_cx = cx_box / (self.img_size * 2)
-                mosaic_cy = cy_box / (self.img_size * 2)
-                mosaic_w = w / (self.img_size * 2)
-                mosaic_h = h / (self.img_size * 2)
-
-                mosaic_boxes.append([mosaic_cx, mosaic_cy, mosaic_w, mosaic_h])
-                mosaic_labels.append(label)
-
-        # Ресайзим до нужного размера
-        mosaic_image = cv2.resize(mosaic_image, (self.img_size, self.img_size))
-
-        # Применяем оставшиеся трансформации
-        if self.transform:
-            transformed = self.transform(
-                image=mosaic_image,
-                bboxes=mosaic_boxes if mosaic_boxes else [],
-                class_labels=mosaic_labels if mosaic_labels else []
-            )
-            mosaic_image = transformed['image']
-            mosaic_boxes = transformed['bboxes'] if 'bboxes' in transformed else []
-            mosaic_labels = transformed['class_labels'] if 'class_labels' in transformed else []
-
-        # Конвертируем в пиксели
-        boxes_pixel = self._yolo_to_pixel(mosaic_boxes, self.img_size, self.img_size)
-
-        return {
-            'image': mosaic_image,
-            'boxes': torch.tensor(boxes_pixel, dtype=torch.float32),
-            'labels': torch.tensor(mosaic_labels, dtype=torch.long),
-            'image_id': idx,
-            'orig_size': (self.img_size * 2, self.img_size * 2),
-            'image_path': 'mosaic'
-        }
 
     def get_dataset_stats(self) -> Dict:
         """Получение статистики датасета"""
@@ -494,31 +395,219 @@ class MinecraftMobsDataset(Dataset):
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
         with open(output_path, 'w') as f:
-            yaml.dump(data_config, f, default_flow_flow=False, allow_unicode=True)
+            yaml.dump(data_config, f, default_flow_style=False, allow_unicode=True)
 
         logger.info(f"Data YAML created at {output_path}")
         return str(output_path)
 
+class MinecraftDatasetRTDETR(Dataset):
+    """Датасет для RT-DETR: возвращает боксы в формате xyxy (пиксели)."""
 
-class COCOFormatDataset(MinecraftMobsDataset):
-    """Датасет с поддержкой COCO формата аннотаций"""
+    def __init__(self, data_dir: str, split: str = 'train', img_size: int = 320):
+        self.data_dir = Path(data_dir)
+        self.split = split
+        self.img_size = img_size
+        self.images_dir = self.data_dir / split / 'images'
+        self.labels_dir = self.data_dir / split / 'labels'
 
-    def _load_coco_annotations(self, annotation_file: str) -> Dict:
-        """Загрузка аннотаций в формате COCO"""
-        with open(annotation_file, 'r') as f:
-            coco_data = json.load(f)
+        self.files = sorted([
+            f.name for f in self.images_dir.glob('*')
+            if f.suffix.lower() in ('.jpg', '.jpeg', '.png')
+            and (self.labels_dir / (f.stem + '.txt')).exists()
+        ])
+        # Для тестов
+        self.files = self.files[:16]
 
-        # Создаем индекс по image_id
-        annotations_by_image = defaultdict(list)
-        for ann in coco_data['annotations']:
-            annotations_by_image[ann['image_id']].append(ann)
+        logger.info(f"[{split}] Loaded {len(self.files)} images")
+
+        self.transform = T.Compose([
+            T.ToTensor(),
+            T.Resize((img_size, img_size)),
+            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, idx):
+        img_file = self.files[idx]
+        img_path = self.images_dir / img_file
+        label_path = self.labels_dir / (Path(img_file).stem + '.txt')
+
+        image_raw = cv2.imread(str(img_path))
+        image_raw = cv2.cvtColor(image_raw, cv2.COLOR_BGR2RGB)
+        orig_h, orig_w = image_raw.shape[:2]
+
+        boxes_xyxy_pixels = []
+        labels_list = []
+
+        if label_path.exists():
+            with open(label_path, 'r') as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if len(parts) < 5:
+                        continue
+                    cls_id = int(parts[0])
+                    cx, cy, w, h = map(float, parts[1:5])
+
+                    cx = max(0.0, min(1.0, cx))
+                    cy = max(0.0, min(1.0, cy))
+                    w = max(1e-6, min(1.0, w))
+                    h = max(1e-6, min(1.0, h))
+
+                    # Считаем координаты в пикселях на оригинальном изображении
+                    x1_px = (cx - w / 2.0) * orig_w
+                    y1_px = (cy - h / 2.0) * orig_h
+                    x2_px = (cx + w / 2.0) * orig_w
+                    y2_px = (cy + h / 2.0) * orig_h
+
+                    x1_px = max(0, min(orig_w, x1_px))
+                    y1_px = max(0, min(orig_h, y1_px))
+                    x2_px = max(0, min(orig_w, x2_px))
+                    y2_px = max(0, min(orig_h, y2_px))
+
+                    if x2_px > x1_px and y2_px > y1_px:
+                        boxes_xyxy_pixels.append([x1_px, y1_px, x2_px, y2_px])
+                        labels_list.append(cls_id)
+
+        image = self.transform(image_raw)
+
+        # Масштабируем боксы под новый размер
+        scale_w = self.img_size / orig_w
+        scale_h = self.img_size / orig_h
+
+        boxes_resized = []
+        for x1, y1, x2, y2 in boxes_xyxy_pixels:
+            boxes_resized.append([
+                x1 * scale_w,
+                y1 * scale_h,
+                x2 * scale_w,
+                y2 * scale_h
+            ])
+
+        if len(boxes_resized) == 0:
+            boxes_tensor = torch.empty((0, 4), dtype=torch.float32)
+            labels_tensor = torch.empty((0,), dtype=torch.long)
+        else:
+            boxes_tensor = torch.tensor(boxes_resized, dtype=torch.float32)
+            labels_tensor = torch.tensor(labels_list, dtype=torch.long)
 
         return {
-            'images': {img['id']: img for img in coco_data['images']},
-            'annotations': annotations_by_image,
-            'categories': {cat['id']: cat for cat in coco_data['categories']}
+            'pixel_values': image,
+            'targets': {
+                'boxes': boxes_tensor,
+                'labels': labels_tensor
+            }
         }
 
+class MinecraftDatasetFasterRCNN(Dataset):
+    """Датасет для Faster R-CNN: возвращает боксы в пикселях."""
+
+    def __init__(self, data_dir: str, split: str = 'train', img_size: int = 640):
+        self.data_dir = Path(data_dir)
+        self.split = split
+        self.img_size = img_size
+        self.images_dir = self.data_dir / split / 'images'
+        self.labels_dir = self.data_dir / split / 'labels'
+
+        self.files = sorted([
+            f.name for f in self.images_dir.glob('*')
+            if f.suffix.lower() in ('.jpg', '.jpeg', '.png')
+            and (self.labels_dir / (f.stem + '.txt')).exists()
+        ])
+        # Для теста можно оставить обрезку, для полноценного обучения убрать
+        # self.files = self.files[:32]
+
+        logger.info(f"[{split}] Loaded {len(self.files)} images")
+
+        self.transform = T.Compose([
+            T.ToTensor(),
+            T.Resize((img_size, img_size)),
+            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, idx):
+        img_file = self.files[idx]
+        img_path = self.images_dir / img_file
+        label_path = self.labels_dir / (Path(img_file).stem + '.txt')
+
+        image_raw = cv2.imread(str(img_path))
+        image_raw = cv2.cvtColor(image_raw, cv2.COLOR_BGR2RGB)
+        orig_h, orig_w = image_raw.shape[:2]
+
+        boxes_xyxy_pixels = []
+        labels_list = []
+
+        if label_path.exists():
+            with open(label_path, 'r') as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if len(parts) < 5:
+                        continue
+                    cls_id = int(parts[0])
+                    cx, cy, w, h = map(float, parts[1:5])
+
+                    # Защита от некорректных значений
+                    w = max(1e-6, min(1.0, w))
+                    h = max(1e-6, min(1.0, h))
+                    cx = max(0.0, min(1.0, cx))
+                    cy = max(0.0, min(1.0, cy))
+
+                    # Считаем координаты в пикселях на оригинальном изображении
+                    x1_px = (cx - w / 2.0) * orig_w
+                    y1_px = (cy - h / 2.0) * orig_h
+                    x2_px = (cx + w / 2.0) * orig_w
+                    y2_px = (cy + h / 2.0) * orig_h
+
+                    # Обрезаем по границам
+                    x1_px = max(0, x1_px)
+                    y1_px = max(0, y1_px)
+                    x2_px = min(orig_w, x2_px)
+                    y2_px = min(orig_h, y2_px)
+
+                    if x2_px <= x1_px or y2_px <= y1_px:
+                        continue
+
+                    boxes_xyxy_pixels.append([x1_px, y1_px, x2_px, y2_px])
+                    labels_list.append(cls_id)
+
+        # Применяем трансформации к изображению
+        image = self.transform(image_raw)
+
+        # Масштабируем боксы под новый размер (img_size x img_size)
+        new_size = self.img_size
+        scale_w = new_size / orig_w
+        scale_h = new_size / orig_h
+
+        boxes_resized = []
+        for x1, y1, x2, y2 in boxes_xyxy_pixels:
+            boxes_resized.append([
+                x1 * scale_w,
+                y1 * scale_h,
+                x2 * scale_w,
+                y2 * scale_h
+            ])
+
+        # Если объектов нет — возвращаем пустые тензоры правильной размерности
+        if len(boxes_resized) == 0:
+            boxes_tensor = torch.empty((0, 4), dtype=torch.float32)
+            labels_tensor = torch.empty((0,), dtype=torch.long)
+        else:
+            boxes_tensor = torch.tensor(boxes_resized, dtype=torch.float32)
+            labels_tensor = torch.tensor(labels_list, dtype=torch.long)
+
+        return {
+            'pixel_values': image,
+            'targets': {
+                'boxes': boxes_tensor,
+                'labels': labels_tensor
+            },
+            'orig_size': (orig_h, orig_w),
+            'image_path': str(img_path)
+        }
 
 def get_dataloader(
         config: Dict,
@@ -611,6 +700,27 @@ def collate_fn(batch: List[Dict]) -> Dict:
         'image_path': image_paths
     }
 
+def collate_fn_faster_rcnn(batch):
+    pixel_values = torch.stack([b['pixel_values'] for b in batch])
+    orig_size = [b['orig_size'] for b in batch]
+    image_path = [b['image_path'] for b in batch]
+
+    targets = [b['targets'] for b in batch]
+
+    return {
+        'pixel_values': pixel_values,
+        'targets': targets,
+        'orig_size': orig_size,
+        'image_path': image_path
+    }
+
+def collate_fn_rtdetr(batch):
+    pixel_values = torch.stack([b['pixel_values'] for b in batch])
+    targets = [b['targets'] for b in batch]
+    return {
+        'pixel_values': pixel_values,
+        'targets': targets
+    }
 
 def create_balanced_sampler(dataset: MinecraftMobsDataset) -> WeightedRandomSampler:
     """
@@ -654,3 +764,105 @@ def create_balanced_sampler(dataset: MinecraftMobsDataset) -> WeightedRandomSamp
         weights.append(weight)
 
     return WeightedRandomSampler(weights, len(weights), replacement=True)
+
+def load_data_detr(data_dir, split='train', img_size=320, max_images=None):
+    """Загружает изображения и аннотации в формате YOLO с фильтрацией"""
+    images_dir = Path(data_dir) / split / 'images'
+    labels_dir = Path(data_dir) / split / 'labels'
+
+    files = []
+    for img_path in images_dir.glob('*'):
+        if img_path.suffix.lower() not in ('.jpg', '.jpeg', '.png'):
+            continue
+        label_path = labels_dir / (img_path.stem + '.txt')
+        if label_path.exists():
+            files.append(img_path.name)
+
+    # ====== ФИЛЬТРАЦИЯ: только валидные боксы ======
+    valid_files = []
+    for img_file in files:
+        label_path = labels_dir / (Path(img_file).stem + '.txt')
+        has_valid_boxes = False
+        if label_path.exists():
+            with open(label_path, 'r') as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if len(parts) >= 5:
+                        try:
+                            cls_id = int(parts[0])
+                            cx, cy, w, h = map(float, parts[1:5])
+                            if 0.0 <= cx <= 1.0 and 0.0 <= cy <= 1.0 and w > 0.01 and h > 0.01:
+                                has_valid_boxes = True
+                                break
+                        except:
+                            continue
+        if has_valid_boxes:
+            valid_files.append(img_file)
+
+    files = valid_files
+    if max_images is not None:
+        files = files[:max_images]
+
+    print(f"[{split}] Загружено {len(files)} изображений (после фильтрации)")
+
+    transform = T.Compose([
+        T.ToTensor(),
+        T.Resize((img_size, img_size)),
+        T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+
+    def get_item(idx):
+        img_file = files[idx]
+        img_path = images_dir / img_file
+        label_path = labels_dir / (Path(img_file).stem + '.txt')
+
+        image = cv2.imread(str(img_path))
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        image = transform(image)
+
+        boxes = []
+        labels = []
+        if label_path.exists():
+            with open(label_path, 'r') as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if len(parts) < 5:
+                        continue
+                    try:
+                        cls_id = int(parts[0])
+                        cx, cy, w, h = map(float, parts[1:5])
+                        if 0 < w <= 1 and 0 < h <= 1 and 0.0 <= cx <= 1.0 and 0.0 <= cy <= 1.0:
+                            boxes.append([cx, cy, w, h])
+                            labels.append(cls_id)
+                    except:
+                        continue
+
+        if len(boxes) == 0:
+            boxes_tensor = torch.zeros((0, 4), dtype=torch.float32)
+            labels_tensor = torch.zeros((0,), dtype=torch.long)
+        else:
+            boxes_tensor = torch.tensor(boxes, dtype=torch.float32)
+            labels_tensor = torch.tensor(labels, dtype=torch.long)
+
+        return image, boxes_tensor, labels_tensor
+
+    return files, get_item
+
+def make_loader_detr(data_dir, split='train', batch_size=2, img_size=320, max_images=None):
+    files, get_item = load_data_detr(data_dir, split, img_size, max_images)
+
+    class SimpleDataset:
+        def __len__(self):
+            return len(files)
+        def __getitem__(self, idx):
+            image, boxes, labels = get_item(idx)
+            return {'pixel_values': image, 'boxes': boxes, 'labels': labels}
+
+    def collate(batch):
+        return {
+            'pixel_values': torch.stack([b['pixel_values'] for b in batch]),
+            'boxes': [b['boxes'] for b in batch],
+            'labels': [b['labels'] for b in batch]
+        }
+
+    return DataLoader(SimpleDataset(), batch_size=batch_size, shuffle=True, collate_fn=collate, num_workers=0)

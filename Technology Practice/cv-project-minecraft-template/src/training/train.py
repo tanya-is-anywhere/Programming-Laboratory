@@ -2,7 +2,7 @@
 Модуль обучения моделей детекции объектов.
 Поддерживает обучение YOLO, Faster R-CNN, DETR, RT-DETR, YOLO-World.
 """
-
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -12,6 +12,9 @@ from torch.optim.lr_scheduler import (
     StepLR,
     OneCycleLR
 )
+from torchmetrics.detection import MeanAveragePrecision
+import os
+import yaml
 from torch.cuda.amp import GradScaler, autocast
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
@@ -22,6 +25,7 @@ import logging
 import time
 from datetime import datetime
 import json
+from ..utils.visualization import plot_training_history
 
 logger = logging.getLogger(__name__)
 
@@ -134,35 +138,36 @@ def create_optimizer(
 ) -> optim.Optimizer:
     """
     Создание оптимизатора с разными learning rates для разных частей модели
-
-    Args:
-        model: Модель
-        config: Конфигурация
-
-    Returns:
-        Оптимизатор
     """
     optimizer_name = config.get('optimizer', 'adamw').lower()
     lr = config.get('lr', 0.001)
     weight_decay = config.get('weight_decay', 0.0005)
 
+    # Получаем параметры (поддерживаем врапперы)
+    if hasattr(model, 'model') and hasattr(model.model, 'parameters'):
+        actual_model = model.model
+    elif hasattr(model, 'parameters'):
+        actual_model = model
+    else:
+        raise AttributeError(f"Model {type(model)} has no parameters()")
+
     # Разделяем параметры на группы (backbone vs head)
-    if hasattr(model, 'backbone') and hasattr(model, 'head'):
+    if hasattr(actual_model, 'backbone') and hasattr(actual_model, 'head'):
         backbone_params = []
         head_params = []
 
-        for name, param in model.named_parameters():
+        for name, param in actual_model.named_parameters():
             if 'backbone' in name:
                 backbone_params.append(param)
             else:
                 head_params.append(param)
 
         param_groups = [
-            {'params': backbone_params, 'lr': lr * 0.1},  # Backbone учим медленнее
+            {'params': backbone_params, 'lr': lr * 0.1},
             {'params': head_params, 'lr': lr}
         ]
     else:
-        param_groups = model.parameters()
+        param_groups = actual_model.parameters()
 
     # Создаем оптимизатор
     if optimizer_name == 'adam':
@@ -174,7 +179,6 @@ def create_optimizer(
         return optim.SGD(param_groups, lr=lr, momentum=momentum, weight_decay=weight_decay)
     else:
         raise ValueError(f"Unknown optimizer: {optimizer_name}")
-
 
 def create_scheduler(
         optimizer: optim.Optimizer,
@@ -245,7 +249,10 @@ def train_one_epoch(
     Returns:
         Словарь со средними значениями лоссов
     """
-    model.train()
+    if hasattr(model, 'model'):
+        model.model.train()
+    else:
+        model.train()
 
     epoch_losses = {
         'total_loss': [],
@@ -259,17 +266,22 @@ def train_one_epoch(
     for batch_idx, batch in enumerate(progress_bar):
         # Перемещаем данные на устройство
         images = batch['image'].to(device)
-        targets = {
-            'boxes': [b.to(device) for b in batch['boxes']],
-            'labels': [l.to(device) for l in batch['labels']]
-        }
+        targets = []
+        for boxes, labels in zip(batch['boxes'], batch['labels']):
+            targets.append({
+                'boxes': boxes.to(device),
+                'labels': labels.to(device)
+            })
 
         optimizer.zero_grad()
 
         # Mixed precision training
         if use_amp and scaler:
             with autocast():
-                loss_dict = model(images, targets)
+                if hasattr(model, 'model'):
+                    loss_dict = model.model(images, targets)
+                else:
+                    loss_dict = model(images, targets)
 
                 if isinstance(loss_dict, dict):
                     total_loss = sum(loss for loss in loss_dict.values())
@@ -280,23 +292,35 @@ def train_one_epoch(
 
             if grad_clip:
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                params = model.model.parameters() if hasattr(model, 'model') else model.parameters()
+                torch.nn.utils.clip_grad_norm_(params, grad_clip)
 
             scaler.step(optimizer)
             scaler.update()
         else:
             # Обычное обучение
-            loss_dict = model(images, targets)
-
-            if isinstance(loss_dict, dict):
-                total_loss = sum(loss for loss in loss_dict.values())
+            if hasattr(model, 'model'):
+                # DETR из Hugging Face принимает pixel_values и labels
+                if isinstance(model.model, torch.nn.Module):
+                    try:
+                        loss_dict = model.model(images, targets)
+                    except:
+                        loss_dict = model.model(images, targets)
+                else:
+                    loss_dict = model.model(images, targets)
             else:
-                total_loss = loss_dict
+                loss_dict = model(images, targets)
+
+            if hasattr(model, 'model'):
+                loss_dict = model.model(images, targets)
+            else:
+                loss_dict = model(images, targets)
 
             total_loss.backward()
 
             if grad_clip:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                params = model.model.parameters() if hasattr(model, 'model') else model.parameters()
+                torch.nn.utils.clip_grad_norm_(params, grad_clip)
 
             optimizer.step()
 
@@ -330,19 +354,12 @@ def validate(
         device: torch.device,
         class_names: List[str] = None
 ) -> Dict[str, float]:
-    """
-    Валидация модели
+    """Валидация модели"""
 
-    Args:
-        model: Модель
-        val_loader: DataLoader с валидационными данными
-        device: Устройство
-        class_names: Имена классов
-
-    Returns:
-        Словарь с метриками валидации
-    """
-    model.eval()
+    if hasattr(model, 'model'):
+        model.model.eval()
+    else:
+        model.eval()
 
     val_losses = {
         'total_loss': [],
@@ -357,13 +374,20 @@ def validate(
 
     for batch in progress_bar:
         images = batch['image'].to(device)
-        targets = {
-            'boxes': [b.to(device) for b in batch['boxes']],
-            'labels': [l.to(device) for l in batch['labels']]
-        }
+
+        # Подготавливаем targets как список словарей
+        batch_targets = []
+        for boxes, labels in zip(batch['boxes'], batch['labels']):
+            batch_targets.append({
+                'boxes': boxes.to(device),
+                'labels': labels.to(device)
+            })
 
         # Вычисляем loss
-        loss_dict = model(images, targets)
+        if hasattr(model, 'model'):
+            loss_dict = model.model(images, batch_targets)
+        else:
+            loss_dict = model(images, batch_targets)
 
         if isinstance(loss_dict, dict):
             total_loss = sum(loss for loss in loss_dict.values())
@@ -377,25 +401,35 @@ def validate(
                 if key in val_losses:
                     val_losses[key].append(value.item())
 
-        # Получаем предсказания
-        predictions = model(images)
+        # Получаем предсказания (в eval режиме)
+        if hasattr(model, 'model'):
+            predictions = model.model(images)
+        else:
+            predictions = model(images)
 
         # Конвертируем для метрик
         for i in range(len(images)):
+            # 🔥 Исправлено: вычитаем 1 из labels (Faster R-CNN: 0=фон, 1-5=классы)
+            pred_labels = predictions[i]['labels'].cpu().numpy()
+            if len(pred_labels) > 0:
+                pred_labels = pred_labels - 1
+
             pred = {
-                'boxes': predictions[i]['boxes'].cpu().numpy() if len(predictions[i]['boxes']) > 0 else [],
-                'scores': predictions[i]['scores'].cpu().numpy() if len(predictions[i]['scores']) > 0 else [],
-                'labels': predictions[i]['labels'].cpu().numpy() if len(predictions[i]['labels']) > 0 else []
+                'boxes': predictions[i]['boxes'].cpu().numpy() if len(predictions[i]['boxes']) > 0 else np.array([]),
+                'scores': predictions[i]['scores'].cpu().numpy() if len(predictions[i]['scores']) > 0 else np.array([]),
+                'labels': pred_labels
             }
+
+            # Берём target для этого изображения
             target = {
-                'boxes': targets['boxes'][i].cpu().numpy() if len(targets['boxes'][i]) > 0 else [],
-                'labels': targets['labels'][i].cpu().numpy() if len(targets['labels'][i]) > 0 else []
+                'boxes': batch['boxes'][i].numpy() if len(batch['boxes'][i]) > 0 else np.array([]),
+                'labels': batch['labels'][i].numpy() if len(batch['labels'][i]) > 0 else np.array([])
             }
 
             all_predictions.append(pred)
             all_targets.append(target)
 
-    # Вычисляем метрики (упрощенно, основное в metrics.py)
+    # Вычисляем метрики
     from src.evaluation.metrics import calculate_map, calculate_precision_recall
 
     map_metrics = calculate_map(
@@ -412,7 +446,6 @@ def validate(
         for key, values in val_losses.items()
     }
 
-    # Объединяем все метрики
     metrics = {
         **avg_losses,
         'mAP_50': map_metrics.get('mAP_50', 0.0),
@@ -461,7 +494,13 @@ def train_model(
         torch.cuda.manual_seed(seed)
 
     # Перемещаем модель на устройство
-    model = model.to(device)
+    try:
+        if hasattr(model, 'to'):
+            model = model.to(device)
+        elif hasattr(model, 'model') and hasattr(model.model, 'to'):
+            model.model = model.model.to(device)
+    except Exception as e:
+        logger.warning(f"Could not move model to device: {e}")
 
     # Создаем оптимизатор и планировщик
     optimizer = create_optimizer(model, config)
@@ -623,64 +662,546 @@ def train_model(
 
     return history
 
+def iou_single_faster_rcnn(box_p, box_t):
+    x1_i = max(box_p[0], box_t[0])
+    y1_i = max(box_p[1], box_t[1])
+    x2_i = min(box_p[2], box_t[2])
+    y2_i = min(box_p[3], box_t[3])
+    inter = max(0.0, x2_i - x1_i) * max(0.0, y2_i - y1_i)
+    area_p = (box_p[2] - box_p[0]) * (box_p[3] - box_p[1])
+    area_t = (box_t[2] - box_t[0]) * (box_t[3] - box_t[1])
+    union = area_p + area_t - inter
+    return inter / (union + 1e-8)
 
-def train_yolo(
-        model: Any,
-        config: Dict,
-        model_name: str,
-        data_yaml_path: str = None
-) -> Dict:
+def compute_precision_at_iou_epoch_faster_rcnn(all_preds, all_targets, iou_thresh=0.5):
+    tp, fp = 0, 0
+
+    for pred, target in zip(all_preds, all_targets):
+        p_boxes = pred['boxes']
+        p_labels = pred['labels']
+        t_boxes = target['boxes']
+        t_labels = target['labels']
+
+        if p_boxes.numel() == 0:
+            continue
+        if t_boxes.numel() == 0:
+            fp += p_boxes.size(0)
+            continue
+
+        used_target = torch.zeros(t_boxes.size(0), dtype=torch.bool)
+
+        for pb, pl in zip(p_boxes, p_labels):
+            best_iou = -1.0
+            best_idx = -1
+
+            for i, (tb, tl) in enumerate(zip(t_boxes, t_labels)):
+                if used_target[i]:
+                    continue
+                if pl != tl:
+                    continue
+
+                iou = iou_single_faster_rcnn(pb, tb)
+                if iou > best_iou:
+                    best_iou = iou
+                    best_idx = i
+
+            if best_iou >= iou_thresh and best_idx != -1:
+                tp += 1
+                used_target[best_idx] = True
+            else:
+                fp += 1
+
+    if tp + fp == 0:
+        return 0.0
+    return tp / (tp + fp)
+
+def train_deformable_detr(
+    model,
+    train_loader,
+    val_loader,
+    epochs=50,
+    lr=1e-4,
+    device='cpu',
+    save_dir='results/deformable_detr'
+):
     """
-    Специальная функция для обучения YOLO моделей
-
-    YOLO имеет встроенный метод train с особым форматом данных
+    Обучение Deformable DETR.
 
     Args:
-        model: YOLO модель
-        config: Конфигурация
-        model_name: Название модели
-        data_yaml_path: Путь к YAML с данными
-
-    Returns:
-        История обучения
+        model: Загруженная модель Deformable DETR (HuggingFace)
+        train_loader: DataLoader для тренировки
+        val_loader: DataLoader для валидации
+        epochs: Количество эпох
+        lr: Скорость обучения
+        device: Устройство ('cpu' или 'cuda')
+        save_dir: Папка для сохранения результатов
     """
-    logger.info(f"Training YOLO model: {model_name}")
+    device = torch.device(device)
+    model = model.to(device)
 
-    # Параметры обучения
-    train_args = {
-        'data': data_yaml_path or 'data/data.yaml',
-        'epochs': config.get('epochs', 100),
-        'imgsz': config.get('image_size', 640),
-        'batch': config.get('batch_size', 16),
-        'lr0': config.get('lr', 0.001),
-        'lrf': config.get('lrf', 0.01),
-        'device': config.get('device', 'cuda'),
-        'workers': config.get('num_workers', 4),
-        'project': 'results/logs',
-        'name': f'yolo_{model_name}',
-        'exist_ok': True,
-        'pretrained': config.get('pretrained', True),
-        'optimizer': config.get('optimizer', 'AdamW'),
-        'seed': config.get('seed', 42),
-        'patience': config.get('patience', 10),
-        'save': True,
-        'plots': True,
-        'verbose': True
-    }
+    # Информация о модели
+    def print_model_info(model):
+        total_params = sum(p.numel() for p in model.parameters())
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
-    # Запуск обучения
-    results = model.train(**train_args)
+        print("\n" + "=" * 60)
+        print("ИНФОРМАЦИЯ О МОДЕЛИ (Deformable DETR)")
+        print("=" * 60)
+        print(f"Всего параметров: {total_params:,} ({total_params / 1e6:.2f} M)")
+        print(f"Обучаемых параметров: {trainable_params:,} ({trainable_params / 1e6:.2f} M)")
 
-    # Извлечение истории
+        if hasattr(model.config, 'model_type'):
+            print(f"Тип модели: {model.config.model_type}")
+        if hasattr(model.config, 'backbone'):
+            print(f"Бэкбон: {model.config.backbone}")
+        if hasattr(model.config, 'num_queries'):
+            print(f"Количество запросов (queries): {model.config.num_queries}")
+        if hasattr(model.config, 'd_model'):
+            print(f"Размерность: {model.config.d_model}")
+        if hasattr(model.config, 'encoder_layers'):
+            print(f"Слоёв энкодера: {model.config.encoder_layers}")
+        if hasattr(model.config, 'decoder_layers'):
+            print(f"Слоёв декодера: {model.config.decoder_layers}")
+
+        print("=" * 60 + "\n")
+
+    print_model_info(model)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+
+    save_dir = Path(save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+
     history = {
-        'train_loss': results.results_dict.get('train/box_loss', []),
-        'val_loss': results.results_dict.get('val/box_loss', []),
-        'mAP_50': results.results_dict.get('metrics/mAP50(B)', 0.0),
-        'mAP_50_95': results.results_dict.get('metrics/mAP50-95(B)', 0.0),
-        'precision': results.results_dict.get('metrics/precision(B)', 0.0),
-        'recall': results.results_dict.get('metrics/recall(B)', 0.0)
+        'train_loss': [],
+        'val_loss': [],
+        'mAP_0.5': [],
+        'mAP_0.5_0.95': [],
+        'precision': [],
+        'recall': [],
+        'f1': []
     }
 
-    logger.info(f"YOLO training completed. mAP@0.5: {history['mAP_50']:.4f}")
+    print(f"Training Deformable DETR on {device}")
+    print(f"Epochs: {epochs}, LR: {lr}")
+    print(f"Train: {len(train_loader.dataset)} images, Val: {len(val_loader.dataset)} images")
+
+    for epoch in range(1, epochs + 1):
+        # === TRAIN ===
+        model.train()
+        total_loss = 0
+
+        for batch in tqdm(train_loader, desc=f'Epoch {epoch}/{epochs} [Train]'):
+            pixel_values = batch['pixel_values'].to(device)
+
+            targets = []
+            for boxes, labels in zip(batch['boxes'], batch['labels']):
+                boxes = boxes.to(device)
+                labels = labels.to(device)
+
+                if labels.numel() > 0:
+                    targets.append({
+                        'boxes': boxes,
+                        'class_labels': labels + 1
+                    })
+                else:
+                    targets.append({
+                        'boxes': torch.zeros((0, 4), dtype=torch.float32, device=device),
+                        'class_labels': torch.zeros((0,), dtype=torch.long, device=device)
+                    })
+
+            optimizer.zero_grad()
+            outputs = model(pixel_values=pixel_values, labels=targets)
+            loss = outputs.loss
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+
+        avg_train_loss = total_loss / len(train_loader)
+        history['train_loss'].append(avg_train_loss)
+
+        # === VAL ===
+        model.eval()
+        val_loss = 0
+        all_preds = []
+        all_targets = []
+
+        with torch.no_grad():
+            for batch in tqdm(val_loader, desc=f'Epoch {epoch}/{epochs} [Val]', leave=False):
+                pixel_values = batch['pixel_values'].to(device)
+
+                # Считаем loss
+                targets = []
+                for boxes, labels in zip(batch['boxes'], batch['labels']):
+                    boxes = boxes.to(device)
+                    labels = labels.to(device)
+                    if labels.numel() > 0:
+                        targets.append({'boxes': boxes, 'class_labels': labels + 1})
+                    else:
+                        targets.append({
+                            'boxes': torch.zeros((0, 4), dtype=torch.float32, device=device),
+                            'class_labels': torch.zeros((0,), dtype=torch.long, device=device)
+                        })
+
+                outputs_loss = model(pixel_values=pixel_values, labels=targets)
+                val_loss += outputs_loss.loss.item()
+
+                # Предсказания для mAP
+                outputs = model(pixel_values=pixel_values, labels=None)
+
+                logits = outputs['logits']
+                pred_boxes = outputs['pred_boxes']
+                probs = torch.nn.functional.softmax(logits, dim=-1)
+                max_probs, pred_labels = probs.max(dim=-1)
+
+                for i in range(pixel_values.shape[0]):
+                    boxes = pred_boxes[i].cpu()
+                    scores = max_probs[i].cpu()
+                    labels = pred_labels[i].cpu()
+                    mask = scores > 0.0001
+                    all_preds.append({
+                        'boxes': boxes[mask],
+                        'scores': scores[mask],
+                        'labels': labels[mask] - 1
+                    })
+
+                for boxes, labels in zip(batch['boxes'], batch['labels']):
+                    if boxes.numel() > 0:
+                        all_targets.append({
+                            'boxes': boxes.cpu(),
+                            'labels': labels.cpu()
+                        })
+                    else:
+                        all_targets.append({
+                            'boxes': torch.zeros((0, 4), dtype=torch.float32),
+                            'labels': torch.zeros((0,), dtype=torch.long)
+                        })
+
+        avg_val_loss = val_loss / len(val_loader)
+        history['val_loss'].append(avg_val_loss)
+
+        # === МЕТРИКИ ===
+        if all_preds and all_targets:
+            metric = MeanAveragePrecision(iou_type='bbox')
+            metric.update(all_preds, all_targets)
+            map_metrics = metric.compute()
+
+            map_50 = map_metrics['map_50'].item()
+            map_50_95 = map_metrics['map'].item()
+            precision = map_metrics.get('precision', torch.tensor(0.0)).mean().item()
+            recall = map_metrics.get('recall', torch.tensor(0.0)).mean().item()
+            f1 = 2 * (precision * recall) / (precision + recall + 1e-8)
+
+            history['mAP_0.5'].append(map_50)
+            history['mAP_0.5_0.95'].append(map_50_95)
+            history['precision'].append(precision)
+            history['recall'].append(recall)
+            history['f1'].append(f1)
+
+            print(f"Epoch {epoch}/{epochs} | "
+                  f"Train Loss: {avg_train_loss:.4f} | "
+                  f"Val Loss: {avg_val_loss:.4f} | "
+                  f"mAP@0.5: {map_50:.4f} | "
+                  f"P: {precision:.4f} | R: {recall:.4f} | F1: {f1:.4f}")
+        else:
+            print(f"Epoch {epoch}/{epochs} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | ⚠️ Нет данных")
+            history['mAP_0.5'].append(0.0)
+            history['mAP_0.5_0.95'].append(0.0)
+            history['precision'].append(0.0)
+            history['recall'].append(0.0)
+            history['f1'].append(0.0)
+
+    # Сохраняем модель и историю
+    model.save_pretrained(save_dir)
+    torch.save(model.state_dict(), save_dir / 'model.pt')
+
+    with open(save_dir / 'history.json', 'w') as f:
+        json.dump(history, f, indent=2)
+
+    print(f'Обучение Deformable DETR завершено! Результаты сохранены в {save_dir}')
+
+    try:
+        plot_training_history(
+            history_path=str(save_dir / 'history.json'),
+            save_dir='results/plots',
+            model_name='Deformable-DETR'
+        )
+
+        logger.info("Графики Faster R-CNN сохранены в results/plots/")
+    except Exception as e:
+        logger.warning(f"Не удалось построить графики: {e}")
 
     return history
+
+def train_faster_rcnn(
+        model,
+        train_loader,
+        val_loader,
+        epochs=100,
+        lr=1e-4,
+        weight_decay=1e-4,
+        device='cpu',
+        save_dir='results/faster_rcnn'
+):
+    save_dir = Path(save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    device = torch.device(device)
+    model = model.to(device)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+    history = {
+        'train_loss': [],
+        'val_precision': [],
+        'learning_rate': [],
+        'mAP_0.5': [],
+        'mAP_0.5_0.95': [],
+        'precision': [],
+        'recall': []
+    }
+
+    logger.info(f"Training Faster R-CNN on {device}")
+    logger.info(f"Epochs: {epochs}, LR: {lr}")
+    logger.info(f"Train: {len(train_loader.dataset)} images, Val: {len(val_loader.dataset)} images")
+
+    best_val_prec = -1.0
+
+    for epoch in range(1, epochs + 1):
+        # === TRAIN ===
+        model.train()
+        train_loss = 0.0
+        train_bar = tqdm(train_loader, desc=f"Epoch {epoch}/{epochs} [Train]")
+
+        for batch in train_bar:
+            pixel_values = batch['pixel_values'].to(device)
+            targets_raw = batch['targets']
+
+            targets = []
+            for t in targets_raw:
+                targets.append({
+                    'boxes': t['boxes'].to(device),
+                    'labels': t['labels'].to(device)
+                })
+
+            optimizer.zero_grad()
+            outputs = model(pixel_values, targets)
+
+            if not isinstance(outputs, dict):
+                raise RuntimeError("Training: model did not return a loss dict.")
+
+            loss = sum(loss_val for loss_val in outputs.values())
+            loss.backward()
+            optimizer.step()
+
+            train_loss += loss.item()
+            train_bar.set_postfix({'loss': f'{loss.item():.4f}'})
+
+        avg_train_loss = train_loss / max(1, len(train_loader))
+        history['train_loss'].append(avg_train_loss)
+
+        # === VAL (с mAP) ===
+        model.eval()
+        all_preds = []
+        all_targets = []
+
+        with torch.no_grad():
+            val_bar = tqdm(val_loader, desc=f"Epoch {epoch}/{epochs} [Val]", leave=False)
+            for batch in val_bar:
+                pixel_values = batch['pixel_values'].to(device)
+                targets_raw = batch['targets']
+
+                outputs = model(pixel_values)
+
+                # Форматируем предсказания для torchmetrics
+                for out in outputs:
+                    boxes = out['boxes'].cpu()
+                    scores = out['scores'].cpu()
+                    labels = out['labels'].cpu()
+                    all_preds.append({
+                        'boxes': boxes,
+                        'scores': scores,
+                        'labels': labels
+                    })
+
+                # Форматируем цели
+                for t in targets_raw:
+                    all_targets.append({
+                        'boxes': t['boxes'].cpu(),
+                        'labels': t['labels'].cpu()
+                    })
+
+        # Считаем mAP
+        metric = MeanAveragePrecision(iou_type='bbox')
+        metric.update(all_preds, all_targets)
+        map_metrics = metric.compute()
+
+        # Извлекаем нужные метрики
+        map_50 = map_metrics['map_50'].item()
+        map_50_95 = map_metrics['map'].item()
+        precision = map_metrics.get('precision', torch.tensor(0.0)).mean().item()
+        recall = map_metrics.get('recall', torch.tensor(0.0)).mean().item()
+
+        # Сохраняем в history
+        history['mAP_0.5'].append(map_50)
+        history['mAP_0.5_0.95'].append(map_50_95)
+        history['precision'].append(precision)
+        history['recall'].append(recall)
+
+        val_prec = compute_precision_at_iou_epoch_faster_rcnn(all_preds, all_targets, iou_thresh=0.5)
+        history['val_precision'].append(val_prec)
+        history['learning_rate'].append(optimizer.param_groups[0]['lr'])
+
+        logger.info(f"Epoch {epoch:3d}/{epochs} | Loss: {avg_train_loss:.4f} | mAP@0.5: {map_50:.4f} | mAP@0.5:0.95: {map_50_95:.4f} | P: {precision:.4f} | R: {recall:.4f}")
+        # Сохраняем лучшую модель по precision
+        if val_prec > best_val_prec:
+            best_val_prec = val_prec
+            best_checkpoint_path = save_dir / 'faster_rcnn_best.pt'
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'val_precision': val_prec,
+                'history': history
+            }, best_checkpoint_path)
+            logger.info(f"New best model saved: {best_checkpoint_path} (Prec@0.5={val_prec:.4f})")
+
+        # Чекпоинт каждые 10 эпох
+        if epoch % 10 == 0:
+            checkpoint_path = save_dir / f'faster_rcnn_epoch_{epoch}.pt'
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'history': history
+            }, checkpoint_path)
+            logger.info(f"Checkpoint: {checkpoint_path}")
+
+    torch.save({
+        'epoch': epochs,
+        'model_state_dict': model.state_dict(),
+        'history': history
+    }, save_dir / 'faster_rcnn_final.pt')
+
+    with open(save_dir / 'history.json', 'w') as f:
+        json.dump(history, f, indent=2)
+
+    best_prec = max(history['val_precision'])
+    logger.info(f"Training complete! Best val Prec@0.5: {best_prec:.4f}")
+
+    try:
+        plot_training_history(
+            history_path=str(save_dir / 'history.json'),
+            save_dir='results/plots',
+            model_name='Faster-RCNN'
+        )
+        logger.info("Графики Faster R-CNN сохранены в results/plots/")
+    except Exception as e:
+        logger.warning(f"Не удалось построить графики: {e}")
+
+    return history
+
+def train_rtdetr(
+        model,
+        train_loader,
+        val_loader,
+        epochs=10,
+        lr=1e-4,
+        device='cpu',
+        save_dir='results/rtdetr'
+):
+    save_dir = Path(save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    device = torch.device(device)
+    model = model.to(device)
+
+    # RT-DETR через ultralytics использует свой пайплайн
+    # Но мы можем использовать стандартный подход с PyTorch
+
+    # Создаём data.yaml для RT-DETR с абсолютным путём
+    data_dir = Path(train_loader.dataset.data_dir).absolute()
+    data_yaml = {
+        'path': str(data_dir),  # <-- ТЕПЕРЬ ПРАВИЛЬНО: абсолютный путь к папке, где лежат train/ и val/
+        'train': 'train/images',
+        'val': 'val/images',
+        'nc': 5,
+        'names': ['creeper', 'skeleton', 'spider', 'zombie', 'enderman']
+    }
+
+    data_yaml_path = save_dir / 'data.yaml'
+    with open(data_yaml_path, 'w') as f:
+        yaml.dump(data_yaml, f)
+
+    # Используем встроенное обучение RT-DETR
+    results = model.model.train(
+        data=str(data_yaml_path),
+        epochs=epochs,
+        imgsz=320,
+        batch=4,
+        lr0=lr,
+        device='cpu',
+        project=str(save_dir),
+        name='rtdetr_run',
+        exist_ok=True,
+        verbose=True,
+        plots=True
+    )
+
+    # Собираем историю из результатов
+    history = {
+        'train_loss': [],
+        'val_loss': [],
+        'learning_rate': [lr],
+        'mAP_0.5': [],
+        'mAP_0.5_0.95': [],
+        'precision': [],
+        'recall': []
+    }
+
+    # Извлекаем метрики из результатов (если доступны)
+    if hasattr(results, 'metrics'):
+        history['mAP_0.5'].append(results.metrics.get('mAP_0.5', 0.0))
+        history['mAP_0.5_0.95'].append(results.metrics.get('mAP_0.5_0.95', 0.0))
+        history['precision'].append(results.metrics.get('precision', 0.0))
+        history['recall'].append(results.metrics.get('recall', 0.0))
+
+    logger.info(f"Training complete! Best mAP@0.5: {max(history['mAP_0.5']) if history['mAP_0.5'] else 0.0:.4f}")
+    return history
+
+def train_model_yolo_world(
+    model,
+    data_yaml_path: str,
+    config: Dict[str, Any],
+    model_name: str = 'yolo_world'
+) -> Dict[str, Any]:
+    """
+    Запускает обучение модели через Ultralytics.
+
+    Args:
+        model: Модель YOLO / YOLO-World
+        data_yaml_path: Путь к data.yaml
+        config: Конфигурация модели из default.yaml
+        model_name: Имя модели для сохранения
+
+    Returns:
+        Dict: Результаты обучения
+    """
+    results = model.train(
+        data=data_yaml_path,
+        epochs=config['epochs'],
+        imgsz=config.get('image_size', 640),
+        batch=config.get('batch_size', 16),
+        lr0=config.get('lr', 0.001),
+        device=config.get('device', 'cpu'),
+        project='results/logs',
+        name=model_name,
+        exist_ok=True,
+        verbose=True
+    )
+
+    return {
+        'model_path': results.save_dir,
+        'results': results
+    }

@@ -8,12 +8,12 @@ project:
   description: "5-model comparison for Minecraft mob detection"
 
 data:
-  raw_path: "D:\otherfiles\Учебная практика Технологическая\minecraft-mobs-yolo-dataset\minecraft_mobs_yolo" #"data/raw/minecraft_mobs"
+  raw_path: "D:/otherfiles/learning_practice_technology/minecraft-mobs-yolo-dataset/minecraft_mobs_yolo" #"data/raw/minecraft_mobs"
   processed_path: "data/processed"
   batch_size: 16
-  image_size: 640
-  num_classes: 6
-  class_names: ["zombie", "skeleton", "creeper", "spider", "enderman", "pig"]
+  image_size: 320
+  num_classes: 5
+  class_names: ["creeper", "skeleton", "spider", "zombie", "enderman"]
   
   splits:
     train: 0.7
@@ -40,6 +40,7 @@ data:
 models:
   yolo:
     variant: "yolov8n"
+    image_size: 320
     pretrained: true
     epochs: 100
     optimizer: "adamw"
@@ -54,9 +55,9 @@ models:
   faster_rcnn:
     backbone: "resnet50"
     pretrained: true
-    epochs: 100
+    epochs: 1
     optimizer: "sgd"
-    lr: 0.005
+    lr: 0.0001
     momentum: 0.9
     weight_decay: 0.0005
     lr_scheduler: "step"
@@ -66,7 +67,7 @@ models:
   detr:
     backbone: "resnet50"
     pretrained: true
-    epochs: 150
+    epochs: 1
     optimizer: "adamw"
     lr: 0.0001
     lr_backbone: 0.00001
@@ -78,13 +79,14 @@ models:
   rt_detr:
     backbone: "resnet50"
     pretrained: true
-    epochs: 100
+    epochs: 1
     optimizer: "adamw"
     lr: 0.0001
     weight_decay: 0.0001
     
   yolo_world:
-    variant: "yolo_world_s"
+    variant: "yolov8s-world.pt"
+    image_size: 320
     pretrained: true
     epochs: 80
     optimizer: "adamw"
@@ -93,7 +95,7 @@ models:
     prompt: "zombie. skeleton. creeper. spider. enderman. pig."
 
 training:
-  device: "cuda"  # "cpu" если нет GPU
+  device: "cpu"  # "cpu" если нет GPU
   seed: 42
   num_workers: 4
   
