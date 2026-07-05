@@ -229,7 +229,7 @@ def train_model(
 
         results = detector.train(train_loader, val_loader)
 
-    print(f"✅ Обучение {model_name} завершено!")
+    print(f"Обучение {model_name} завершено!")
     return results
 
 
@@ -251,7 +251,7 @@ def train_models(
 
     results = {}
     for model_name in model_names:
-        print(f"\n🚀 Запуск обучения {model_name}...")
+        print(f"\nЗапуск обучения {model_name}...")
         results[model_name] = train_model(
             model_name,
             config,
