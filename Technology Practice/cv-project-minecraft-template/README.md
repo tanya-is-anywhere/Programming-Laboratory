@@ -1,14 +1,6 @@
-# Minecraft Mobs Detection — Сравнение моделей компьютерного зрения
-
-<div align="center">
-  <img src="https://img.shields.io/badge/Python-3.10%2B-blue" alt="Python"/>
-  <img src="https://img.shields.io/badge/PyTorch-2.0%2B-orange" alt="PyTorch"/>
-  <img src="https://img.shields.io/badge/Ultralytics-8.0%2B-red" alt="Ultralytics"/>
-  <img src="https://img.shields.io/badge/License-MIT-green" alt="License"/>
-</div>
-
+Minecraft Mobs Detection — Сравнение моделей компьютерного зрения
 ---
-
+Автор (студент): Шилинцева Татьяна Валерьевна (группа БВТ2402)
 ##  О проекте
 
 Данный проект представляет собой сравнительное исследование пяти архитектур детекции объектов для обнаружения мобов в игре **Minecraft**. В рамках работы были обучены и протестированы модели:
@@ -41,7 +33,7 @@ cv-project-minecraft-template/
 │ └── default.yaml # Конфигурация обучения
 ├── data/
 │ ├── raw/ # Сырые данные (датасет)
-│ └── processed/ # Предобработанные данные
+│ └── processed/ # Предобработанные данные (не использовалась)
 ├── results/
 │ ├── logs/ # Логи экспериментов
 │ ├── plots/ # Графики и визуализации
@@ -49,8 +41,7 @@ cv-project-minecraft-template/
 ├── outputs/
 │ └── videos/ # Выходные видео
 ├── scripts/
-│ ├── detect_video.py # Обработка видео
-│ └── demo_realtime.py # Демо с веб-камерой
+│ └── detect_video.py # Обработка видео
 ├── src/
 │ ├── dataset/ # Классы датасетов
 │ ├── models/ # Реализации моделей
@@ -71,3 +62,74 @@ cv-project-minecraft-template/
 ```bash
 git clone https://github.com/your-username/cv-project-minecraft-template.git
 cd cv-project-minecraft-template
+```
+
+### 2. Создай виртуальное окружение
+
+```bash
+python -m venv .venv
+.venv\Scripts\activate
+```
+
+### 3. Установи зависимости
+
+```bash
+pip install -r requirements.txt
+```
+
+### 4. Подготовь датасет
+
+Скачай датасет с Kaggle
+
+Распакуй в data/raw/minecraft_mobs_yolo/
+
+Или укажи путь в configs/default.yaml (поле raw_path)
+
+### Обучи одну или несколько моделей
+Все команды запускаются из корневой папки проекта.
+#### Запуск одной модели
+```bash
+python main.py --model yolo --epochs 50 --batch_size 16
+```
+#### Запуск нескольких моделей
+```bash
+python main.py --model yolo,yolo_world,rtdetr --epochs 30 --batch_size 8
+```
+#### Запуск всех моделей
+```bash
+python main.py --all --epochs 100
+```
+#### Переопределение параметров
+```bash
+python main.py --model faster_rcnn --epochs 50 --image_size 480 --device cuda
+```
+### Доступные аргументы
+| Аргумент | Описание |
+|---------|------------|
+| `--model` | Имя модели или список через запятую |
+| `--all` | Обучить все модели |
+| `--epochs` | Количество эпох |
+| `--batch_size` | Размер батча |
+| `--image_size` | Размер изображения |
+| `--device` | Устройство (cpu или cuda) |
+
+## Результаты
+| Модель          | mAP@0.5 | mAP@0.5:0.95 | Precision | Recall | FPS (CPU) |
+|-----------------|---------|------------|-----------|--------|-----------|
+| `YOLO`          | 0.891   |0.680   | 0.953     | 0.831  | 13.5      |
+| `YOLO-World`    | 0.928   |0.741   | 0.973     | 0.884  | 39.8      |
+| `RT-DETR`       | 0.862   |0.653   | 0.899     | 0.797  | 182.5     |
+| `Faster R-CNN`  | 0.542   |0.345   | 0.6557    | 0.554  | 146.44    |
+### Выводы
+- YOLO-World — лучшая точность, но медленнее
+
+- YOLO — оптимальный выбор для реального времени
+
+- RT-DETR — хорошая точность для трансформерной модели
+
+- Faster R-CNN — стабильная, но уступает современным моделям
+
+## Обработка видео (пример)
+```
+python scripts/detect_video.py --model yolo_world --weights "C:/../веса.pt" --input "C:/../исходное видео.mp4" --output "C:/../minecraft_with_boxes.mp4" --conf 0.3 --skip-frames 1
+```
