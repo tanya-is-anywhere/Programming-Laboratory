@@ -39,7 +39,6 @@ __all__ = [
     'get_model',
     'MODEL_REGISTRY',
     'train_model',
-    'train_yolo',
     'evaluate_model',
     'save_metrics',
     'compare_models',

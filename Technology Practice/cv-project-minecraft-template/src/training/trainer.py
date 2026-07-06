@@ -70,7 +70,6 @@ def train_model(
             data_yaml_path=data_yaml_path
         )
 
-    # ====== RT-DETR (Ultralytics) ======
     elif model_name in ['rtdetr', 'rt_detr']:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         project_root = os.getcwd()
@@ -88,7 +87,6 @@ def train_model(
             verbose=True
         )
 
-    # ====== Faster R-CNN ======
     elif model_name == 'faster_rcnn':
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         save_dir = os.path.join('results', f'faster_rcnn_{timestamp}')
@@ -107,7 +105,6 @@ def train_model(
             img_size=model_config.get('image_size', config['data']['image_size'])
         )
 
-        # DataLoader'ы
         train_loader = DataLoader(
             train_dataset,
             batch_size=model_config.get('batch_size', config['data']['batch_size']),
@@ -124,7 +121,6 @@ def train_model(
             num_workers=0
         )
         detector.build_model()
-        # Запускаем обучение
         history = train_faster_rcnn(
             model=detector.model,
             train_loader=train_loader,
@@ -141,7 +137,6 @@ def train_model(
             'history': history
         }
 
-    # ====== DETR / Deformable DETR ======
     elif model_name in ['detr', 'deformable_detr']:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         save_dir = os.path.join('results', f'detr_{timestamp}')
@@ -166,7 +161,7 @@ def train_model(
 
         detector.build_model()
         history = train_deformable_detr(
-            model=detector.model,  # или detector.model, в зависимости от реализации
+            model=detector.model,
             train_loader=train_loader,
             val_loader=val_loader,
             epochs=model_config.get('epochs', 50),
@@ -180,8 +175,6 @@ def train_model(
             'history': history
         }
 
-
-    # ====== Faster R-CNN / DETR ======
     else:
         box_format = 'cxcywh' if 'detr' in model_name else 'pixel_xyxy_orig'
 
