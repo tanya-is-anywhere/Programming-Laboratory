@@ -1,3 +1,6 @@
+# ====== 
+# visualize.py - файл, с помощью которого можно обработать картинку: рамки вокруг объектов рисуются на основе предсказания модели
+# ======
 import cv2
 import matplotlib.pyplot as plt
 from src.dataset.dataset import MinecraftMobsDataset
