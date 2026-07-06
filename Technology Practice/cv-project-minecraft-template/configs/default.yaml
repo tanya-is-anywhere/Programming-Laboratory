@@ -8,7 +8,7 @@ project:
   description: "5-model comparison for Minecraft mob detection"
 
 data:
-  raw_path: "D:/otherfiles/learning_practice_technology/minecraft-mobs-yolo-dataset/minecraft_mobs_yolo" #"data/raw/minecraft_mobs"
+  raw_path: "data/raw/minecraft_mobs_yolo"
   processed_path: "data/processed"
   batch_size: 16
   image_size: 320

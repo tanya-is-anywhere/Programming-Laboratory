@@ -15,11 +15,14 @@ class RTDETRModel:
     Работает как YOLO, но с RT-DETR архитектурой.
     """
 
-    def __init__(self, num_classes: int = 5):
+    def __init__(self, num_classes: int = 5, class_names: List[str] = None):
         self.num_classes = num_classes
         self.model = None
         self.device = 'cpu'
         self.variant = 'rtdetr-l.pt'
+        self.class_names = class_names or [
+            'creeper', 'skeleton', 'spider', 'zombie', 'enderman'
+        ]
 
     def build_model(self, variant: str = 'rtdetr-l.pt') -> None:
         """Создание модели RT-DETR"""
@@ -70,12 +73,16 @@ class RTDETRModel:
             'results': results
         }
 
-    def predict(self, image: Union[str, np.ndarray], conf: float = 0.25) -> Dict:
+    def predict(self, image: Union[np.ndarray, torch.Tensor], conf_threshold: float = 0.25) -> Dict:
         """Предсказание для одного изображения"""
         if self.model is None:
             raise ValueError("Model not built or loaded")
 
-        results = self.model.predict(image, conf=conf)[0]
+        if isinstance(image, torch.Tensor):
+            image = image.permute(1, 2, 0).cpu().numpy()
+            image = (image * 255).astype(np.uint8)
+
+        results = self.model.predict(image, conf=conf_threshold)[0]
 
         if len(results.boxes) > 0:
             boxes = results.boxes.xyxy.cpu().numpy()
@@ -89,7 +96,8 @@ class RTDETRModel:
         return {
             'boxes': boxes.tolist() if len(boxes) > 0 else [],
             'scores': scores.tolist() if len(scores) > 0 else [],
-            'labels': labels.tolist() if len(labels) > 0 else []
+            'labels': labels.tolist() if len(labels) > 0 else [],
+            'class_names': [self.class_names[l] for l in labels] if len(labels) > 0 else []
         }
 
     def predict_batch(self, images: List[Union[str, np.ndarray]]) -> List[Dict]:
