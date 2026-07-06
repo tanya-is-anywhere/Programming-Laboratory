@@ -382,13 +382,15 @@ class MinecraftMobsDataset(Dataset):
         Returns:
             Путь к созданному файлу
         """
+        project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        data_dir = os.path.relpath(self.data_dir, project_root)
         data_config = {
-            'path': str(self.data_dir.absolute()),
-            'train': f'{self.split}/images',
-            'val': f'{self.split}/images',
-            'test': f'{self.split}/images',
+            'path': '.',
+            'train': os.path.join(data_dir, 'train', 'images'),
+            'val': os.path.join(data_dir, 'val', 'images'),
+            'test': os.path.join(data_dir, 'test', 'images'),
             'nc': self.num_classes,
-            'names': {i: name for i, name in enumerate(self.class_names)}
+            'names': self.class_names
         }
 
         output_path = Path(output_path)
