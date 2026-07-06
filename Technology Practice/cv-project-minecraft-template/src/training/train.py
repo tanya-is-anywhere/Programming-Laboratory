@@ -26,13 +26,11 @@ import time
 from datetime import datetime
 import json
 from ..utils.visualization import plot_training_history
-
+from src.evaluation.metrics import calculate_map, calculate_precision_recall
 logger = logging.getLogger(__name__)
 
 
 class EarlyStopping:
-    """Ранняя остановка обучения"""
-
     def __init__(
             self,
             patience: int = 10,
@@ -407,9 +405,7 @@ def validate(
         else:
             predictions = model(images)
 
-        # Конвертируем для метрик
         for i in range(len(images)):
-            # 🔥 Исправлено: вычитаем 1 из labels (Faster R-CNN: 0=фон, 1-5=классы)
             pred_labels = predictions[i]['labels'].cpu().numpy()
             if len(pred_labels) > 0:
                 pred_labels = pred_labels - 1
@@ -420,7 +416,6 @@ def validate(
                 'labels': pred_labels
             }
 
-            # Берём target для этого изображения
             target = {
                 'boxes': batch['boxes'][i].numpy() if len(batch['boxes'][i]) > 0 else np.array([]),
                 'labels': batch['labels'][i].numpy() if len(batch['labels'][i]) > 0 else np.array([])
@@ -428,9 +423,6 @@ def validate(
 
             all_predictions.append(pred)
             all_targets.append(target)
-
-    # Вычисляем метрики
-    from src.evaluation.metrics import calculate_map, calculate_precision_recall
 
     map_metrics = calculate_map(
         predictions=all_predictions,
@@ -881,7 +873,6 @@ def train_deformable_detr(
         avg_val_loss = val_loss / len(val_loader)
         history['val_loss'].append(avg_val_loss)
 
-        # === МЕТРИКИ ===
         if all_preds and all_targets:
             metric = MeanAveragePrecision(iou_type='bbox')
             metric.update(all_preds, all_targets)
